@@ -7,6 +7,7 @@ on:
       - 'frontend/**'
       - '.github/workflows/frontend-ci.yml'
   pull_request:
+    branches: [main, master]
     paths:
       - 'frontend/**'
       - '.github/workflows/frontend-ci.yml'
@@ -63,8 +64,23 @@ jobs:
       - name: Test
         run: npm run test
 
+      # Vite inlines these at build time; without them the uploaded bundle
+      # throws on first config access.
       - name: Build
         run: npm run build
+        env:
+          VITE_CONTRACT_ID: CAUAO7CYKULE2K4EJMQ6LLRUHP7Y7JYOH6G2VBXKYG7PTETE3UZ3DU7Q
+          VITE_RPC_URL: https://soroban-testnet.stellar.org
+          VITE_NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+
+      - name: Verify env vars were inlined into the bundle
+        # Match the inlined env object key, not the raw value — config.ts's
+        # dev fallbacks contain the same values and would mask a missing var.
+        run: |
+          for var in VITE_CONTRACT_ID VITE_RPC_URL VITE_NETWORK_PASSPHRASE; do
+            grep -rqE "${var}:[\`\"'][^\`\"']+" dist/assets/ \
+              || { echo "::error::${var} was not inlined into the build"; exit 1; }
+          done
 
       # Uploaded from a single Node version — the artifact is for inspecting a
       # failed build, not for release, so two copies add nothing.

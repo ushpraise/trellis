@@ -59,7 +59,9 @@ Use this JSON output in CI to detect gas regressions (>10% increase).
 
 **Benchmarked operations:**
 - `init` (1 milestone and 10 milestones)
-- `lock_funds`
+- `lock_funds` (1 milestone and 10 milestones — the 10-milestone case is the
+  regression guard for #401: a milestone state transition must cost the same
+  regardless of how many milestones the agreement has)
 - `submit_work`
 - `approve_and_release`
 - `raise_dispute`
@@ -198,7 +200,7 @@ PROPTEST_SEED=12345 cargo test prop_balance_conservation_happy_path
 
 ```bash
 # Run benchmark on both commits
-git checkout main
+git checkout master
 cargo bench --bench contract_bench > baseline.json
 
 git checkout feature-branch

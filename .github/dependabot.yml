@@ -48,7 +48,7 @@ updates:
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
-      - "ci"
+      - "infrastructure"
     groups:
       actions-security-updates:
         applies-to: "security-updates"

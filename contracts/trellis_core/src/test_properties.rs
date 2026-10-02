@@ -16,7 +16,12 @@
 //!    nowhere.
 //!
 //! 2. **State machine reachability** — `approve_and_release` always fails with
-//!    `InvalidStateTransition` unless the milestone is `WorkSubmitted`.
+//!    `InvalidStateTransition` unless the milestone is `WorkSubmitted`. This
+//!    covers the non-`WorkSubmitted` states in both directions: the pre-funding
+//!    states (`Pending`, `Funded`) and the terminal ones (`Completed`,
+//!    `Disputed`, `Refunded`) — the latter being the re-entry / double-approval
+//!    paths where a missed check would pay the payee twice out of the pooled
+//!    contract balance (#392).
 //!
 //! 3. **Zero/negative-amount rejection** — `init` always fails with
 //!    `InvalidMilestone` when any milestone has `amount <= 0`, regardless of
@@ -42,76 +47,35 @@
 //!    sweep with `PROPTEST_CASES=10000 cargo test test_properties`.
 
 use proptest::prelude::*;
-use soroban_sdk::{
-    testutils::Address as _,
-    token, Address, BytesN, Env, Vec,
-};
+
+/// Deterministic proptest configuration.
+///
+/// The CI snapshot-validation step re-runs the suite and diffs the regenerated
+/// `test_snapshots/` tree, so the generated values must be identical on every
+/// run.  proptest otherwise seeds its RNG from a random source, which would
+/// make every regeneration produce a spurious diff.
+fn deterministic_config() -> ProptestConfig {
+    ProptestConfig {
+        cases: 256,
+        rng_algorithm: proptest::test_runner::RngAlgorithm::ChaCha,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(0x5454_5454),
+        ..ProptestConfig::default()
+    }
+}
+use soroban_sdk::{testutils::Address as _, token, Address, BytesN, Env, Vec};
 
 use crate::{
     errors::TrellisError,
-    types::{EscrowStatus, Milestone},
-    TrellisContract, TrellisContractClient,
+    test_utils::{agreement_id, milestones_from_amounts, setup_mocked},
+    types::EscrowStatus,
 };
-
-// ---------------------------------------------------------------------------
-// Helpers shared with the property tests
-// ---------------------------------------------------------------------------
-
-fn agreement_id(env: &Env, seed: u8) -> BytesN<32> {
-    BytesN::from_array(env, &[seed; 32])
-}
-
-/// Spin up a fresh Soroban environment with a funded payer.
-///
-/// Returns `(env, payer, payee, dispute_resolver, token_address, client)`.
-fn setup() -> (
-    Env,
-    Address,
-    Address,
-    Address,
-    Address,
-    TrellisContractClient<'static>,
-) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let payer = Address::generate(&env);
-    let payee = Address::generate(&env);
-    let dispute_resolver = Address::generate(&env);
-
-    let token_admin = Address::generate(&env);
-    let token_address = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
-    // Mint generously so any combination of milestone amounts can be funded.
-    token_admin_client.mint(&payer, &1_000_000_000);
-
-    let contract_id = env.register(TrellisContract, ());
-    let client = TrellisContractClient::new(&env, &contract_id);
-
-    (env, payer, payee, dispute_resolver, token_address, client)
-}
-
-/// Build a `Vec<Milestone>` from a slice of amounts. All statuses are Pending.
-fn milestones_from_amounts(env: &Env, amounts: &[i128]) -> Vec<Milestone> {
-    let mut v: Vec<Milestone> = Vec::new(env);
-    for (i, &amount) in amounts.iter().enumerate() {
-        v.push_back(Milestone {
-            id: i as u32,
-            amount,
-            status: EscrowStatus::Pending,
-            proof_uri: None,
-        });
-    }
-    v
-}
 
 // ---------------------------------------------------------------------------
 // Invariant 1 — Balance conservation
 // ---------------------------------------------------------------------------
 
 proptest! {
+    #![proptest_config(deterministic_config())]
     /// Verify balance conservation through a complete happy-path sequence for a
     /// randomly sized multi-milestone agreement (1–5 milestones, each 1–10_000).
     /// After every lock/release pair the contract balance must track exactly.
@@ -119,7 +83,7 @@ proptest! {
     fn prop_balance_conservation_happy_path(
         amounts in prop::collection::vec(1i128..=10_000i128, 1..=5usize),
     ) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let token_client = token::TokenClient::new(&env, &token_address);
         let id = agreement_id(&env, 42);
 
@@ -179,7 +143,7 @@ proptest! {
     fn prop_balance_conservation_dispute_refund(
         amounts in prop::collection::vec(1i128..=10_000i128, 1..=3usize),
     ) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let token_client = token::TokenClient::new(&env, &token_address);
         let id = agreement_id(&env, 43);
 
@@ -195,7 +159,7 @@ proptest! {
             locked += amount;
 
             // Balance must not change when raising a dispute.
-            client.raise_dispute(&payer, &id, &mid);
+            client.raise_dispute(&payer, &id, &mid, &None);
 
             prop_assert_eq!(
                 token_client.balance(&client.address),
@@ -227,11 +191,12 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
+    #![proptest_config(deterministic_config())]
     /// approve_and_release on a Pending milestone always fails, regardless of
     /// the milestone amount.
     #[test]
     fn prop_approve_on_pending_always_fails(amount in 1i128..=100_000i128) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let id = agreement_id(&env, 50);
 
         client.init(
@@ -252,7 +217,7 @@ proptest! {
     /// the milestone amount.
     #[test]
     fn prop_approve_on_funded_always_fails(amount in 1i128..=100_000i128) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let id = agreement_id(&env, 51);
 
         client.init(
@@ -269,6 +234,115 @@ proptest! {
             "approve on Funded must always fail"
         );
     }
+
+    /// #392 — terminal-state re-entry, part 1: a Disputed milestone is a
+    /// `resolve_dispute` entrypoint, never an `approve_and_release` one. A
+    /// disputed milestone still holds the escrowed amount, so approving it
+    /// directly would release funds before the resolver has ruled on them.
+    #[test]
+    fn prop_approve_on_disputed_always_fails(amount in 1i128..=100_000i128) {
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let token_client = token::TokenClient::new(&env, &token_address);
+        let id = agreement_id(&env, 52);
+
+        client.init(
+            &id, &payer, &payee, &token_address,
+            &milestones_from_amounts(&env, &[amount]),
+            &dispute_resolver,
+        );
+        client.lock_funds(&id, &0u32);
+        client.raise_dispute(&payer, &id, &0u32);
+
+        let result = client.try_approve_and_release(&id, &0u32);
+        prop_assert_eq!(
+            result,
+            Err(Ok(TrellisError::InvalidStateTransition)),
+            "approve on Disputed must always fail"
+        );
+        // Fund-safety consequence: the rejected call must not release anything.
+        prop_assert_eq!(
+            token_client.balance(&payee), 0,
+            "approve on Disputed must not pay the payee"
+        );
+        prop_assert_eq!(
+            token_client.balance(&client.address), amount,
+            "the escrowed amount must stay locked while the dispute is open"
+        );
+    }
+
+    /// #392 — terminal-state re-entry, part 2: a Refunded milestone has already
+    /// had its funds returned to the payer. A second
+    /// `approve_and_release` against it would pay the payee out of the pooled
+    /// balance that other agreements' milestones are funded from.
+    #[test]
+    fn prop_approve_on_refunded_always_fails(amount in 1i128..=100_000i128) {
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let token_client = token::TokenClient::new(&env, &token_address);
+        let id = agreement_id(&env, 53);
+
+        client.init(
+            &id, &payer, &payee, &token_address,
+            &milestones_from_amounts(&env, &[amount]),
+            &dispute_resolver,
+        );
+        // A cancelled unfunded milestone is Refunded; fund it and refund it via
+        // the dispute path instead, so the milestone really did hold funds.
+        client.lock_funds(&id, &0u32);
+        client.raise_dispute(&payer, &id, &0u32);
+        client.resolve_dispute(&id, &0u32, &true);
+
+        let result = client.try_approve_and_release(&id, &0u32);
+        prop_assert_eq!(
+            result,
+            Err(Ok(TrellisError::InvalidStateTransition)),
+            "approve on Refunded must always fail"
+        );
+        prop_assert_eq!(
+            token_client.balance(&payee), 0,
+            "approve on Refunded must not pay the payee"
+        );
+        prop_assert_eq!(
+            token_client.balance(&client.address), 0,
+            "the refunded amount must not re-enter the escrow balance"
+        );
+    }
+
+    /// #392 — terminal-state re-entry, part 3: double approval. A Completed
+    /// milestone's funds have already been transferred to the payee, so the
+    /// second call must fail *and* leave the payee's balance untouched — the
+    /// pool is shared by every milestone on the same token, so an unguarded
+    /// second release would drain another milestone's escrow.
+    #[test]
+    fn prop_double_approve_on_completed_always_fails(amount in 1i128..=100_000i128) {
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let token_client = token::TokenClient::new(&env, &token_address);
+        let id = agreement_id(&env, 54);
+
+        client.init(
+            &id, &payer, &payee, &token_address,
+            &milestones_from_amounts(&env, &[amount]),
+            &dispute_resolver,
+        );
+        client.lock_funds(&id, &0u32);
+        client.submit_work(&id, &0u32, &None);
+        client.approve_and_release(&id, &0u32);
+
+        prop_assert_eq!(
+            token_client.balance(&payee), amount,
+            "the first release must pay the payee exactly once"
+        );
+
+        let result = client.try_approve_and_release(&id, &0u32);
+        prop_assert_eq!(
+            result,
+            Err(Ok(TrellisError::InvalidStateTransition)),
+            "a second approve on a Completed milestone must always fail"
+        );
+        prop_assert_eq!(
+            token_client.balance(&payee), amount,
+            "the rejected re-entry must not pay the payee a second time"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,10 +350,11 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
+    #![proptest_config(deterministic_config())]
     /// init with a single zero-amount milestone always returns InvalidMilestone.
     #[test]
     fn prop_zero_amount_always_rejected(seed in 0u8..=200u8) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         // Use a different ID each run to avoid AlreadyInitialized masking the error.
         let id = BytesN::from_array(&env, &[seed; 32]);
 
@@ -298,7 +373,7 @@ proptest! {
     /// init with a negative milestone amount always returns InvalidMilestone.
     #[test]
     fn prop_negative_amount_always_rejected(amount in i128::MIN..=-1i128) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let id = agreement_id(&env, 60);
 
         let result = client.try_init(
@@ -320,7 +395,7 @@ proptest! {
         prefix_amounts in prop::collection::vec(1i128..=10_000i128, 0..=3usize),
         suffix_amounts in prop::collection::vec(1i128..=10_000i128, 0..=3usize),
     ) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let id = agreement_id(&env, 61);
 
         // Interleave a zero in the middle.
@@ -346,13 +421,14 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
+    #![proptest_config(deterministic_config())]
     /// The pre-computed total_amount on any successfully created agreement
     /// equals the arithmetic sum of all its milestone amounts.
     #[test]
     fn prop_total_amount_equals_sum(
         amounts in prop::collection::vec(1i128..=10_000i128, 1..=8usize),
     ) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let id = agreement_id(&env, 70);
 
         let expected_total: i128 = amounts.iter().sum();
@@ -374,6 +450,7 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 proptest! {
+    #![proptest_config(deterministic_config())]
     /// Completing milestone 0 in a two-milestone agreement must not change
     /// the state of milestone 1, regardless of milestone amounts.
     #[test]
@@ -381,7 +458,7 @@ proptest! {
         amount0 in 1i128..=10_000i128,
         amount1 in 1i128..=10_000i128,
     ) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let id = agreement_id(&env, 80);
 
         let milestones = milestones_from_amounts(&env, &[amount0, amount1]);
@@ -408,7 +485,7 @@ proptest! {
         amount0 in 1i128..=10_000i128,
         amount1 in 1i128..=10_000i128,
     ) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let id = agreement_id(&env, 81);
 
         let milestones = milestones_from_amounts(&env, &[amount0, amount1]);
@@ -458,6 +535,7 @@ fn fuzz_op_strategy() -> impl Strategy<Value = FuzzOp> {
 }
 
 proptest! {
+    #![proptest_config(deterministic_config())]
     /// Applies a random sequence of operations, targeting randomly chosen
     /// milestones in a multi-milestone agreement, in random order — skipping
     /// any operation that isn't a legal transition from that milestone's
@@ -472,7 +550,7 @@ proptest! {
         amounts in prop::collection::vec(1i128..=10_000i128, 2..=4usize),
         ops in prop::collection::vec((0usize..4, fuzz_op_strategy()), 20..=60usize),
     ) {
-        let (env, payer, payee, dispute_resolver, token_address, client) = setup();
+        let (env, payer, payee, dispute_resolver, token_address, client) = setup_mocked();
         let token_client = token::TokenClient::new(&env, &token_address);
         let id = agreement_id(&env, 90);
 
@@ -530,7 +608,7 @@ proptest! {
                     expected_balance -= amounts[i];
                 }
                 FuzzOp::Dispute => {
-                    client.raise_dispute(&payer, &id, &mid);
+                    client.raise_dispute(&payer, &id, &mid, &None);
                     status[i] = EscrowStatus::Disputed;
                 }
                 FuzzOp::ResolveRefund => {
@@ -545,7 +623,7 @@ proptest! {
                 }
                 FuzzOp::Cancel => {
                     client.cancel_unfunded_milestone(&id, &mid);
-                    status[i] = EscrowStatus::Refunded;
+                    status[i] = EscrowStatus::Cancelled;
                 }
             }
 

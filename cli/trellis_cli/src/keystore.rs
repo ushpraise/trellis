@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-use std::fs;
 use std::io;
 
 /// Keystore service for managing Stellar secret keys securely.
@@ -35,7 +33,7 @@ impl Keystore {
     pub fn remove_from_keychain(&self, identity: &str) -> io::Result<()> {
         keyring::Entry::new(&self.keyring_service, identity)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?
-            .delete_password()
+            .delete_credential()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 

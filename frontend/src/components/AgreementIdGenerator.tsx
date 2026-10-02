@@ -77,14 +77,16 @@ export function AgreementIdGenerator({ onGenerate }: AgreementIdGeneratorProps) 
         })
         setShared(true)
         setTimeout(() => setShared(false), 2000)
-      } catch {
-        // User cancelled (AbortError) — do nothing; other errors are unexpected
+      } catch (err) {
+        // User cancelled the share sheet (AbortError) — intentional, stay silent
+        if (err instanceof DOMException && err.name === 'AbortError') return
+        toast.error({ title: 'Share failed', message: 'Could not open the share dialog. Try copying the ID instead.' })
       }
     } else {
       // Web Share API unavailable — copy to clipboard instead
       await handleCopy()
     }
-  }, [agreementId, handleCopy])
+  }, [agreementId, handleCopy, toast])
 
   return (
     <div className="w-full max-w-md mx-auto p-4 sm:p-6 bg-navy-800 dark:bg-navy-800 light:bg-gray-50 rounded-lg border border-navy-700 dark:border-navy-700 light:border-gray-200 shadow-lg">

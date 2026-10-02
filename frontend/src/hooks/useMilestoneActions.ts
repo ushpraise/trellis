@@ -1,4 +1,8 @@
 import { useState } from 'react';
+import { nativeToScVal, type xdr } from '@stellar/stellar-sdk';
+import { useContractInvoke } from './useContractInvoke';
+import { proofUriToScVal } from '../components/MilestoneActions';
+import { hexToBytes } from '../lib/format';
 import type { Milestone, Agreement, EscrowStatus } from '../lib/soroban';
 
 interface WalletLike {
@@ -15,6 +19,7 @@ const STATUS_BADGE_COLORS: Record<EscrowStatus, string> = {
   Completed: 'bg-green-600',
   Disputed: 'bg-red-600',
   Refunded: 'bg-gray-600',
+  Cancelled: 'bg-slate-500',
 };
 
 export function getStatusBadgeColor(status: EscrowStatus): string {
@@ -27,7 +32,13 @@ export function getStatusBadgeColor(status: EscrowStatus): string {
  * milestone, so the two layouts never drift out of sync on what actions
  * are available or how they behave.
  */
-export function useMilestoneActions(milestone: Milestone, agreement: Agreement, wallet: WalletLike) {
+export function useMilestoneActions(
+  milestone: Milestone,
+  agreement: Agreement,
+  wallet: WalletLike,
+  onSuccess?: () => void,
+) {
+  const { invoke } = useContractInvoke();
   const [actionLoading, setActionLoading] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showProofInput, setShowProofInput] = useState(false);
@@ -36,8 +47,16 @@ export function useMilestoneActions(milestone: Milestone, agreement: Agreement, 
   const isUserPayer = wallet.publicKey === agreement.payer;
   const isUserPayee = wallet.publicKey === agreement.payee;
 
-  const handleLockFunds = async () => {
-    if (!wallet.connected) {
+  // lock_funds, submit_work and approve_and_release take no caller argument — the
+  // contract derives the signer from agreement.payer / agreement.payee. Only
+  // raise_dispute takes an explicit leading `caller`.
+  const runAction = async (
+    method: string,
+    buildArgs: () => xdr.ScVal[],
+    failureMessage: string,
+    onDone?: () => void,
+  ) => {
+    if (!wallet.connected || !wallet.publicKey) {
       setActionError('Please connect your wallet');
       return;
     }
@@ -46,82 +65,48 @@ export function useMilestoneActions(milestone: Milestone, agreement: Agreement, 
     setActionError(null);
 
     try {
-      // TODO: Implement contract call to lock_funds
-      console.log('Lock funds action not yet implemented');
-      setActionError('Lock funds action not yet implemented');
+      await invoke(method, buildArgs(), wallet.publicKey);
+      onDone?.();
+      onSuccess?.();
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Failed to lock funds');
+      setActionError(error instanceof Error ? error.message : failureMessage);
     } finally {
       setActionLoading(false);
     }
   };
 
-  const handleSubmitWork = async () => {
-    if (!wallet.connected) {
-      setActionError('Please connect your wallet');
-      return;
-    }
+  const idArgs = () => [
+    nativeToScVal(hexToBytes(agreement.agreement_id), { type: 'bytes' }),
+    nativeToScVal(milestone.id, { type: 'u32' }),
+  ];
 
+  const handleLockFunds = () => runAction('lock_funds', idArgs, 'Failed to lock funds');
+
+  const handleSubmitWork = () => {
+    // First click reveals the proof input; the next click submits.
+    if (!showProofInput) {
+      setShowProofInput(true);
+      return Promise.resolve();
+    }
     if (!proofUri.trim()) {
       setActionError('Please enter a proof URI');
-      return;
+      return Promise.resolve();
     }
-
-    setActionLoading(true);
-    setActionError(null);
-
-    try {
-      // TODO: Implement contract call to submit_work
-      console.log('Submit work action not yet implemented');
-      setActionError('Submit work action not yet implemented');
+    return runAction('submit_work', () => [...idArgs(), proofUriToScVal(proofUri)], 'Failed to submit work', () => {
       setShowProofInput(false);
       setProofUri('');
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Failed to submit work');
-    } finally {
-      setActionLoading(false);
-    }
+    });
   };
 
-  const handleApproveRelease = async () => {
-    if (!wallet.connected) {
-      setActionError('Please connect your wallet');
-      return;
-    }
+  const handleApproveRelease = () =>
+    runAction('approve_and_release', idArgs, 'Failed to approve and release');
 
-    setActionLoading(true);
-    setActionError(null);
-
-    try {
-      // TODO: Implement contract call to approve_and_release
-      console.log('Approve and release action not yet implemented');
-      setActionError('Approve and release action not yet implemented');
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Failed to approve and release');
-    } finally {
-      setActionLoading(false);
-    }
-  };
-
-  const handleRaiseDispute = async () => {
-    if (!wallet.connected) {
-      setActionError('Please connect your wallet');
-      return;
-    }
-
-    setActionLoading(true);
-    setActionError(null);
-
-    try {
-      // TODO: Implement contract call to raise_dispute
-      console.log('Raise dispute action not yet implemented');
-      setActionError('Raise dispute action not yet implemented');
-    } catch (error) {
-      setActionError(error instanceof Error ? error.message : 'Failed to raise dispute');
-    } finally {
-      setActionLoading(false);
-    }
-  };
+  const handleRaiseDispute = () =>
+    runAction(
+      'raise_dispute',
+      () => [nativeToScVal(wallet.publicKey, { type: 'address' }), ...idArgs()],
+      'Failed to raise dispute',
+    );
 
   const availableActions: Array<{ label: string; action: () => void; requiresWallet?: boolean }> = [];
 
@@ -137,7 +122,8 @@ export function useMilestoneActions(milestone: Milestone, agreement: Agreement, 
     availableActions.push({ label: 'Approve & Release', action: handleApproveRelease, requiresWallet: true });
   }
 
-  if ((milestone.status === 'Funded' || milestone.status === 'WorkSubmitted') && wallet.connected) {
+  // raise_dispute rejects any caller other than the payer or payee.
+  if ((milestone.status === 'Funded' || milestone.status === 'WorkSubmitted') && wallet.connected && (isUserPayer || isUserPayee)) {
     availableActions.push({ label: 'Raise Dispute', action: handleRaiseDispute, requiresWallet: true });
   }
 

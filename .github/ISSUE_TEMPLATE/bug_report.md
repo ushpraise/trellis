@@ -29,7 +29,7 @@ What actually happened. Include error messages, stack traces, or transaction has
 - Component: (contract / cli / frontend)
 - OS:
 - Rust / Node version:
-- Network: (testnet / futurenet / local)
+- Network: (testnet / mainnet / futurenet / custom)
 - Commit or version:
 
 ## Additional context

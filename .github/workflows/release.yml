@@ -28,12 +28,15 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   changelog:
     name: Generate changelog
     runs-on: ubuntu-latest
+    # Pushes the regenerated CHANGELOG.md back to the default branch.
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -130,6 +133,28 @@ jobs:
             exit 1
           fi
 
+  # Same gate as contract-ci.yml's `verify` job: a release must never ship
+  # binaries built from a commit whose fmt/clippy/test checks fail.
+  verify:
+    name: Test, clippy & fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # rust-toolchain.toml pins the compiler, rustfmt and clippy.
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --workspace
+
   build-contract:
     name: Build contract WASM
     needs: verify-version
@@ -142,6 +167,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Fail release builds if Cargo.lock is not consistent with Cargo.toml.
+      - name: Verify Cargo.lock is up-to-date
+        run: |
+          set -euo pipefail
+          echo "::group::Cargo.lock verification"
+          cargo check --locked --workspace
+          echo "::endgroup::"
 
       - name: Build trellis_core WASM
         # `cargo rustc` targeting wasm32-unknown-unknown, not `stellar contract
@@ -186,6 +222,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Keyed per target so the OS matrix legs never share a cache.
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
       - name: Build trellis CLI
         run: cargo build --frozen --release --manifest-path=cli/trellis_cli/Cargo.toml --target=${{ matrix.target }}
 
@@ -207,8 +249,10 @@ jobs:
     # builds and version check. Tag pushes are unaffected: `inputs.dry_run` is
     # empty there, so the first clause is true.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run == false }}
-    needs: [changelog, build-contract, build-cli]
+    needs: [changelog, verify, build-contract, build-cli]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v8

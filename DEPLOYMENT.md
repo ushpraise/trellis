@@ -1,5 +1,10 @@
 # Trellis — Testnet Deployment
 
+> **Working directory:** Run deployment commands from the repository root. Each
+> step begins with `cd "$(git rev-parse --show-toplevel)"` so it can be run
+> independently from any directory inside the repository. Paths to build
+> artifacts below are relative to the repository root.
+
 ## Live Contract
 
 | Network | Contract ID |
@@ -58,6 +63,7 @@ signature alongside every WASM/CLI binary artifact.
 ### Step 1 — Create and fund a testnet identity
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
 stellar keys generate trellis-deployer --network testnet
 stellar keys fund trellis-deployer --network testnet --rpc-url https://soroban-testnet.stellar.org
 ```
@@ -65,8 +71,8 @@ stellar keys fund trellis-deployer --network testnet --rpc-url https://soroban-t
 ### Step 2 — Build the contract WASM
 
 ```bash
-cd contracts/trellis_core
-cargo rustc --manifest-path=Cargo.toml --crate-type=cdylib --target=wasm32-unknown-unknown --release
+cd "$(git rev-parse --show-toplevel)"
+cargo rustc --manifest-path=contracts/trellis_core/Cargo.toml --crate-type=cdylib --target=wasm32-unknown-unknown --release
 ```
 
 > **Note:** Use `cargo rustc` with `--target=wasm32-unknown-unknown` rather than
@@ -82,8 +88,9 @@ target/wasm32-unknown-unknown/release/trellis_core.wasm
 ### Step 3 — Deploy to testnet
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
 stellar contract deploy \
-  --wasm ../../target/wasm32-unknown-unknown/release/trellis_core.wasm \
+  --wasm target/wasm32-unknown-unknown/release/trellis_core.wasm \
   --source trellis-deployer \
   --network testnet
 ```
@@ -93,6 +100,7 @@ This returns a `C...` contract address. Save it — you'll need it for all CLI c
 ### Step 4 — Set environment variables
 
 ```bash
+cd "$(git rev-parse --show-toplevel)"
 export STELLAR_RPC_URL="https://soroban-testnet.stellar.org"
 export STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 export TRELLIS_CONTRACT_ID="<your contract ID>"
@@ -102,11 +110,12 @@ export TRELLIS_SOURCE_KEY="<your stellar identity name>"
 ### Step 5 — Build the CLI
 
 ```bash
-cd cli/trellis_cli
-cargo build --release
+cd "$(git rev-parse --show-toplevel)"
+cargo build --release --manifest-path=cli/trellis_cli/Cargo.toml
 ```
 
-Binary will be at: `target/release/trellis.exe` (Windows) or `target/release/trellis` (Linux/Mac)
+Binary will be at `target/release/trellis.exe` (Windows) or
+`target/release/trellis` (Linux/Mac), relative to the repository root.
 
 ---
 
@@ -155,6 +164,8 @@ trellis submit-work \
 `--proof-uri` is optional — omit it to mark the milestone submitted without a
 proof link. Do not pass an empty string: the contract stores `proof_uri` as an
 `Option`, so "no proof" is the absent flag, not `""`.
+The web UI follows the same rule: leaving the Proof URI field blank submits
+`None`, not an empty string.
 
 ### Approve and release payment
 
@@ -174,6 +185,9 @@ trellis raise-dispute \
 ```
 
 > Can be called by either the payer or the payee
+
+In the web UI, the Dispute button only appears when the connected wallet is the
+agreement's payer or payee; any other wallet sees an explanatory note instead.
 
 ### Resolve a dispute
 
@@ -195,6 +209,19 @@ trellis cancel-milestone --agreement-id <hex> --milestone-id 0
 ```
 
 > Must be signed by the payer. Only works on milestones still in `Pending` status.
+
+### Check RPC connectivity
+
+```bash
+trellis health
+trellis --json health   # {"status":"success","result":{"health":{...},"latest_ledger":{"hash","protocol_version","sequence"}},...}
+```
+
+> Calls the Soroban `getHealth` and `getLatestLedger` JSON-RPC methods directly
+> over HTTP. The `stellar` binary, `TRELLIS_CONTRACT_ID` and `TRELLIS_SOURCE_KEY`
+> are all optional here, since only the RPC URL is used. Exits non-zero if the
+> endpoint is unreachable or does not report `healthy`. `--dry-run` prints the
+> JSON-RPC requests without sending them.
 
 ---
 

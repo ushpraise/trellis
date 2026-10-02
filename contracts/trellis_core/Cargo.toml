@@ -5,8 +5,13 @@ edition = "2021"
 license = "MIT"
 publish = false
 
+# `cdylib` is the artifact that gets deployed to Soroban; `rlib` lets the
+# in-crate `[[bench]]` target `use trellis_core::…` the same way an external
+# consumer does (without it `cargo clippy --all-targets` fails to link the
+# bench). Both are emitted, so `make build-contract` still produces
+# `trellis_core.wasm`.
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 # soroban-sdk 22.x only — the on-chain ABI (env interface version) is tied to
 # the major version, and each minor/patch is expected to stay
@@ -16,8 +21,18 @@ crate-type = ["cdylib"]
 # Deploying the compiled WASM requires a `stellar` CLI build that supports the
 # soroban-sdk 22.x host environment — see DEPLOYMENT.md's Prerequisites for
 # the version this repo has been verified against.
+#
+# COUPLING: cli/trellis_cli/build.rs reads the soroban-sdk requirement below
+# (the [dependencies] entry) and embeds it in `trellis --version`. Keep it on a
+# single line; the CLI build fails if the entry cannot be found.
+#
+# No `alloc` feature: the contract only uses the SDK's host-object-backed
+# `Vec` / `Map` / `String` / `BytesN`, which need no guest-side allocator.
+# Removing it was verified against the full build + test suite, and it made
+# no difference to the release WASM size (#466). Re-add it only if guest
+# heap types (`alloc::vec::Vec`, `alloc::string::String`, …) are introduced.
 [dependencies]
-soroban-sdk = { version = ">=22.0.0, <23", features = ["alloc"] }
+soroban-sdk = { version = ">=22.0.0, <23" }
 
 [dev-dependencies]
 soroban-sdk = { version = ">=22.0.0, <23", features = ["testutils"] }

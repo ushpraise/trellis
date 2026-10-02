@@ -25,7 +25,7 @@ export default function MilestoneRow({ milestone, agreement, wallet }: Milestone
     proofUri,
     setProofUri,
     isUserPayee,
-  } = useMilestoneActions(milestone, agreement, wallet);
+  } = useMilestoneActions(milestone, agreement, wallet, onUpdate);
 
   return (
     <tr className="border-b border-navy-700 dark:border-navy-700 light:border-gray-200 hover:bg-navy-700/50 dark:hover:bg-navy-700/50 light:hover:bg-gray-100">

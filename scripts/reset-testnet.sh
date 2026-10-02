@@ -50,6 +50,10 @@ done
 PAYER=$(stellar keys address trellis-payer)
 PAYEE=$(stellar keys address trellis-payee)
 RESOLVER=$(stellar keys address trellis-resolver)
+USDC_ISSUER="GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+# `init` needs the USDC Stellar Asset Contract (C...) address, not the
+# issuer account (G...) — derive it from the asset.
+USDC_SAC=$(stellar contract id asset --network testnet --asset "USDC:$USDC_ISSUER")
 AGREEMENT_ID=$(printf '01%.0s' {1..64} | head -c 64)
 
 export STELLAR_RPC_URL="$RPC_URL"
@@ -62,7 +66,7 @@ echo "==> Creating fresh test agreement"
   --agreement-id "$AGREEMENT_ID" \
   --payer "$PAYER" \
   --payee "$PAYEE" \
-  --token "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5" \
+  --token "$USDC_SAC" \
   --resolver "$RESOLVER" \
   --milestones "1000"
 

@@ -34,7 +34,7 @@ pub fn sanitize_proof_uri(uri: &str) -> Result<String, String> {
     }
 
     // Normalize to NFC to prevent homoglyph attacks.
-    use unicode_normalization::Nfc;
-    let normalized: String = Nfc::new(uri).collect();
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = uri.nfc().collect();
     Ok(normalized)
 }

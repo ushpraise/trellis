@@ -16,7 +16,7 @@ interface MilestoneCardProps {
 }
 
 /** Mobile single-column card — paired with `MilestoneRow` for the desktop table. */
-export default function MilestoneCard({ milestone, agreement, wallet }: MilestoneCardProps) {
+export default function MilestoneCard({ milestone, agreement, wallet, onUpdate }: MilestoneCardProps) {
   const {
     availableActions,
     actionLoading,
@@ -26,7 +26,7 @@ export default function MilestoneCard({ milestone, agreement, wallet }: Mileston
     proofUri,
     setProofUri,
     isUserPayee,
-  } = useMilestoneActions(milestone, agreement, wallet);
+  } = useMilestoneActions(milestone, agreement, wallet, onUpdate);
 
   return (
     <div className="rounded-lg border border-navy-700 bg-navy-800/60 p-4">

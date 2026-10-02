@@ -1,9 +1,15 @@
 mod commands;
 mod config;
 mod input;
+mod keystore;
 mod rpc;
 mod sanitizer;
+mod strkey;
 mod utils;
+
+#[cfg(test)]
+#[path = "../sdk_compat.rs"]
+mod sdk_compat;
 
 use clap::{CommandFactory, Parser};
 use commands::{Commands, OutputFormat, OutputOpts};
@@ -36,9 +42,16 @@ use std::process;
     // still shows the bare crate version above. Includes the on-chain
     // contract's soroban-sdk compatibility range so bug reports carry
     // enough environment context without a separate lookup.
+    //
+    // COUPLING: the range is not hardcoded — `build.rs` reads it from the
+    // `soroban-sdk` entry in contracts/trellis_core/Cargo.toml and fails the
+    // build if it cannot be found, so a contract SDK bump is picked up here
+    // automatically.
     long_version = concat!(
         env!("CARGO_PKG_VERSION"),
-        "\nsoroban-sdk compat: >=22.0.0, <23 (see contracts/trellis_core/Cargo.toml)",
+        "\nsoroban-sdk compat: ",
+        env!("TRELLIS_SOROBAN_SDK_COMPAT"),
+        " (see contracts/trellis_core/Cargo.toml)",
     ),
     author,
     about,
@@ -104,20 +117,28 @@ struct Cli {
 // Environment validation (#68)
 // ---------------------------------------------------------------------------
 
-/// Verify that the `stellar` CLI binary is available in `PATH`.
+/// The minimum `stellar` CLI major version required by this tool.
+///
+/// DEPLOYMENT.md documents `stellar CLI 26.x+` as a prerequisite.
+const STELLAR_MIN_MAJOR: u64 = 26;
+
+/// Verify that the `stellar` CLI binary is available in `PATH` **and** that
+/// its reported major version meets the documented minimum (`26.x+`).
 ///
 /// This is called once at startup so users get a clear, actionable error
-/// message instead of a cryptic OS-level "program not found" when the binary
-/// is missing.
+/// message instead of a cryptic OS-level "program not found" or an obscure
+/// RPC/argument error deep inside the invoke path.
 ///
-/// Returns `Ok(())` if the binary is found, or `Err(message)` with
-/// installation instructions if it is not.
+/// Returns `Ok(())` if the binary is found and version-compatible, or
+/// `Err(message)` with installation/upgrade instructions otherwise.
 fn validate_environment() -> Result<(), String> {
     use std::process::Command;
 
-    match Command::new(rpc::stellar_bin()).arg("--version").output() {
-        Ok(_) => Ok(()),
-        Err(_) => Err("Error: `stellar` CLI not found in PATH.\n\
+    let output = Command::new(rpc::stellar_bin())
+        .arg("--version")
+        .output()
+        .map_err(|_| {
+            "Error: `stellar` CLI not found in PATH.\n\
              \n\
              Install it with:\n\
              \n\
@@ -127,8 +148,59 @@ fn validate_environment() -> Result<(), String> {
              \thttps://developers.stellar.org/docs/tools/cli/install-cli\n\
              \n\
              After installing, run `stellar --version` to confirm the installation."
-            .to_string()),
+                .to_string()
+        })?;
+
+    // `stellar --version` prints something like "stellar 26.0.0\n" to stdout.
+    // Parse the first version-looking token (digits separated by dots) from
+    // the combined stdout + stderr so we are robust against minor format
+    // changes across releases.
+    let version_output = String::from_utf8_lossy(&output.stdout);
+    let version_output = version_output.trim();
+
+    let detected_major = version_output
+        .split_whitespace()
+        .find_map(|token| {
+            // Take the first token that looks like a semver / version number
+            // (starts with a digit, contains at least one dot).
+            if token.starts_with(|c: char| c.is_ascii_digit()) && token.contains('.') {
+                token
+                    .split('.')
+                    .next()
+                    .and_then(|major| major.parse::<u64>().ok())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            format!(
+                "Error: could not determine the `stellar` CLI version.\n\
+                 \n\
+                 `stellar --version` produced unexpected output: {version_output:?}\n\
+                 \n\
+                 Expected output like `stellar 26.0.0`.  Please ensure you have\n\
+                 stellar CLI {STELLAR_MIN_MAJOR}.x or newer installed:\n\
+                 \n\
+                 \tcargo install --locked stellar-cli --features opt\n\
+                 \thttps://developers.stellar.org/docs/tools/cli/install-cli"
+            )
+        })?;
+
+    if detected_major < STELLAR_MIN_MAJOR {
+        return Err(format!(
+            "Error: `stellar` CLI version {detected_major}.x detected, \
+             but version {STELLAR_MIN_MAJOR}.x or newer is required.\n\
+             \n\
+             Upgrade with:\n\
+             \n\
+             \tcargo install --locked stellar-cli --features opt\n\
+             \n\
+             Or follow the official guide:\n\
+             \thttps://developers.stellar.org/docs/tools/cli/install-cli"
+        ));
     }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -156,10 +228,23 @@ fn main() {
         return;
     }
 
-    // ── #68: Validate stellar binary at startup ────────────────────────────
-    if let Err(msg) = validate_environment() {
-        eprintln!("{msg}");
-        process::exit(1);
+    // ── #406: Skip stellar-binary check for --dry-run ─────────────────────
+    // --dry-run only prints the command that would run; it never spawns the
+    // stellar binary itself.  Requiring the binary here blocks a legitimate
+    // use-case: previewing command construction on a machine where the
+    // stellar CLI is not (yet) installed, or in CI environments that only
+    // need to inspect the generated invocation.
+    //
+    // ── #68: Validate stellar binary at startup (non-dry-run only) ────────
+    // `health` talks to the RPC endpoint natively (#467/#468), so it needs
+    // neither the `stellar` binary nor a contract ID / source key.
+    let native_only = matches!(cli.command, Commands::Health);
+
+    if !cli.dry_run && !native_only {
+        if let Err(msg) = validate_environment() {
+            eprintln!("{msg}");
+            process::exit(1);
+        }
     }
 
     // ── #80: Resolve config from --network preset + CLI / env overrides ───
@@ -167,6 +252,7 @@ fn main() {
         cli.network,
         cli.rpc_url.clone(),
         cli.network_passphrase.clone(),
+        cli.source_key_file.clone(),
     ) {
         Ok(c) => c,
         Err(msg) => {
@@ -177,7 +263,12 @@ fn main() {
 
     // ── #236/#237: Reject a malformed contract ID or RPC URL up front with
     // a clear message instead of a cryptic failure deep in the Stellar CLI. ─
-    if let Err(errors) = config.validate() {
+    let validation = if native_only {
+        config::validate_rpc_url(&config.rpc_url).map_err(|e| vec![e])
+    } else {
+        config.validate()
+    };
+    if let Err(errors) = validation {
         eprintln!("Error: invalid configuration:");
         for e in &errors {
             eprintln!("  - {e}");
@@ -193,7 +284,7 @@ fn main() {
     // Rejects malformed URLs and cleartext HTTP to non-localhost hosts so a
     // compromised `.env` cannot point the CLI at a forged RPC endpoint.
     // `--unsafe-rpc` downgrades the hard error to a printed warning.
-    match config::validate_rpc_url(&config.rpc_url, cli.unsafe_rpc) {
+    match config::check_rpc_transport(&config.rpc_url, cli.unsafe_rpc) {
         Ok(Some(warning)) => eprintln!("{warning}"),
         Ok(None) => {}
         Err(msg) => {
@@ -225,5 +316,91 @@ fn main() {
             eprintln!("{msg}");
         }
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strkey::{decode, encode, StrkeyError, StrkeyKind};
+
+    #[test]
+    fn long_version_reports_manifest_sdk_range() {
+        let rendered = Cli::command().render_long_version();
+        let expected = format!(
+            "soroban-sdk compat: {} (see contracts/trellis_core/Cargo.toml)",
+            env!("TRELLIS_SOROBAN_SDK_COMPAT")
+        );
+        assert!(rendered.contains(&expected), "got: {rendered}");
+    }
+
+    #[test]
+    fn short_version_stays_bare() {
+        let rendered = Cli::command().render_version();
+        assert!(!rendered.contains("soroban-sdk"), "got: {rendered}");
+        assert!(rendered.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    // ── Strkey codec smoke tests ──────────────────────────────────────────
+    // The full test-vector suite lives in `strkey.rs`; these tests ensure the
+    // module is wired into the CLI crate and that the public API round-trips
+    // through the same entry points downstream sub-tasks will use.
+
+    #[test]
+    fn strkey_round_trips_ed25519_public_key() {
+        // Known-good G-address (Stellar docs example).
+        let g = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+        let (kind, bytes) = decode(g).expect("valid G-address");
+        assert_eq!(kind, StrkeyKind::Ed25519PublicKey);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(encode(StrkeyKind::Ed25519PublicKey, &bytes).unwrap(), g);
+    }
+
+    #[test]
+    fn strkey_round_trips_ed25519_secret_seed() {
+        // Known-good S-address (Stellar docs example).
+        let s = "SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let (kind, bytes) = decode(s).expect("valid S-address");
+        assert_eq!(kind, StrkeyKind::Ed25519SecretSeed);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(encode(StrkeyKind::Ed25519SecretSeed, &bytes).unwrap(), s);
+    }
+
+    #[test]
+    fn strkey_round_trips_contract() {
+        // Known-good C-address (Stellar docs example).
+        let c = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM";
+        let (kind, bytes) = decode(c).expect("valid C-address");
+        assert_eq!(kind, StrkeyKind::Contract);
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(encode(StrkeyKind::Contract, &bytes).unwrap(), c);
+    }
+
+    #[test]
+    fn strkey_rejects_corrupted_checksum() {
+        // Flip the final base32 character of a valid G-address; the CRC16
+        // trailer must reject it rather than silently returning garbage.
+        let mut corrupted = String::from("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF");
+        corrupted.pop();
+        corrupted.push('G');
+        match decode(&corrupted) {
+            Err(StrkeyError::InvalidChecksum) => {}
+            other => panic!("expected InvalidChecksum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strkey_rejects_unknown_version_byte() {
+        // A valid base32 + CRC16 payload with an unrecognized version byte
+        // must be rejected — guards against silently accepting future or
+        // foreign strkey variants.
+        let bad = encode(StrkeyKind::Ed25519PublicKey, &[0u8; 32]).unwrap();
+        let mut bytes = crate::strkey::base32_decode(&bad).unwrap();
+        bytes[0] = 0xFF;
+        let reencoded = crate::strkey::base32_encode(&bytes);
+        match decode(&reencoded) {
+            Err(StrkeyError::UnknownVersion(0xFF)) => {}
+            other => panic!("expected UnknownVersion(0xFF), got {other:?}"),
+        }
     }
 }
